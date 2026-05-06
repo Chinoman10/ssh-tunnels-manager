@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { ServicePresetDocument } from "./types.ts";
+import type { ServicePresetDocument } from "./types.ts";
 
 let cache: ServicePresetDocument | null = null;
 

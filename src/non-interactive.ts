@@ -28,7 +28,7 @@ function validateFlags(flags: CliFlags): string[] {
     return issues;
 }
 
-async function configFromFlags(flags: CliFlags): Promise<TunnelConfig> {
+export async function configFromFlags(flags: CliFlags): Promise<TunnelConfig> {
     if (flags.profile) {
         const profiles = await loadProfiles();
         const profile = profiles.find(
@@ -111,7 +111,11 @@ export async function runNonInteractive(flags: CliFlags): Promise<void> {
         }
     });
 
-    await manager.start(config);
+    const snapshot = await manager.start(config);
+    if (snapshot.state === "failed") {
+        await manager.stopAll();
+        process.exit(1);
+    }
     console.log(`Session ${config.id} running. Press Ctrl+C to stop.`);
 
     process.on("SIGINT", async () => {

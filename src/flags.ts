@@ -1,10 +1,38 @@
-import { CliFlags, ProbePermission, TunnelMode } from "./types.ts";
+import type { CliFlags, ProbePermission, TunnelMode } from "./types.ts";
 import { coercePort, splitShellArgs } from "./utils.ts";
 
-const HELP_TEXT = `ssh-tunnels-manager\n\nUsage:\n  bun run src/index.ts [options]\n\nOptions:\n  --non-interactive           Run without TUI prompts\n  --target <alias|user@host>  SSH target alias or destination\n  --mode <L|R|D>              Tunnel mode (local, remote, dynamic)\n  --local-port <port>         Local bind port\n  --remote-host <host>        Remote host (default 127.0.0.1)\n  --remote-port <port>        Remote target port\n  --bind-address <ip>         Local bind address (default 127.0.0.1)\n  --ssh-extra \"...\"          Extra ssh args\n  --profile <name>            Launch from saved profile\n  --dry-run                   Print command and exit\n  --skip-preflight            Skip preflight checks\n  --auto-reconnect            Auto-restart when ssh exits\n  --docker-bridge             Enable docker bridge sidecar\n  --docker-network <name>     Add docker network (repeatable)\n  --reverse-domain <domain>   Force reverse proxy domain target\n  --probe-permission <yes|always|no>\n                              Probe behavior for remote reverse proxy checks\n  --help                      Show this help\n`;
+const HELP_TEXT = `ssh-tunnels-manager
+
+Usage:
+  bun run src/index.ts [options]
+  bun run src/index.ts diagnose [options]
+
+Options:
+  --non-interactive           Run without TUI prompts
+  --target <alias|user@host>  SSH target alias or destination
+  --mode <L|R|D>              Tunnel mode (local, remote, dynamic)
+  --local-port <port>         Local bind port
+  --remote-host <host>        Remote host (default 127.0.0.1)
+  --remote-port <port>        Remote target port
+  --bind-address <ip>         Local bind address (default 127.0.0.1)
+  --ssh-extra "..."          Extra ssh args
+  --profile <name>            Launch from saved profile
+  --dry-run                   Print command and exit
+  --skip-preflight            Skip preflight checks
+  --auto-reconnect            Auto-restart when ssh exits
+  --docker-bridge             Enable docker bridge sidecar
+  --docker-network <name>     Add docker network (repeatable)
+  --reverse-domain <domain>   Force reverse proxy domain target
+  --probe-permission <yes|always|no>
+                              Probe behavior for remote reverse proxy checks
+  --replace-existing          Reserved for explicit future replacement flow
+  --keep-failed-bridge        Keep failed remote bridge container for debugging
+  --help                      Show this help
+`;
 
 export function parseFlags(argv: string[]): CliFlags {
   const defaults: CliFlags = {
+    diagnose: false,
     nonInteractive: false,
     skipPreflight: false,
     dryRun: false,
@@ -17,6 +45,12 @@ export function parseFlags(argv: string[]): CliFlags {
     const arg = argv[i];
     const next = argv[i + 1];
 
+    if (i === 0 && arg === "diagnose") {
+      defaults.diagnose = true;
+      defaults.nonInteractive = true;
+      continue;
+    }
+
     if (arg === "--help" || arg === "-h") {
       console.log(HELP_TEXT);
       process.exit(0);
@@ -27,6 +61,8 @@ export function parseFlags(argv: string[]): CliFlags {
     else if (arg === "--dry-run") defaults.dryRun = true;
     else if (arg === "--auto-reconnect") defaults.autoReconnect = true;
     else if (arg === "--docker-bridge") defaults.dockerBridge = true;
+    else if (arg === "--replace-existing") defaults.replaceExisting = true;
+    else if (arg === "--keep-failed-bridge") defaults.keepFailedBridgeContainer = true;
     else if (arg === "--target" && next) {
       defaults.target = next;
       i += 1;

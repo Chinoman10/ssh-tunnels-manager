@@ -29,4 +29,12 @@ describe("parseFlags", () => {
     expect(flags.dockerBridge).toBe(true);
     expect(flags.dockerNetworks).toEqual(["coolify"]);
   });
+
+  test("parses diagnose command as non-interactive", () => {
+    const flags = parseFlags(["diagnose", "--profile", "ssdnodes2-portainer"]);
+
+    expect(flags.diagnose).toBe(true);
+    expect(flags.nonInteractive).toBe(true);
+    expect(flags.profile).toBe("ssdnodes2-portainer");
+  });
 });

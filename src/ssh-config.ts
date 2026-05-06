@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { SshHostEntry } from "./types.ts";
+import type { SshHostEntry } from "./types.ts";
 import { execCommand } from "./utils.ts";
 
 interface ParseContext {
@@ -38,7 +38,9 @@ async function parseFile(filePath: string, ctx: ParseContext): Promise<void> {
 
     const includeMatch = line.match(/^Include\s+(.+)$/i);
     if (includeMatch) {
-      const patterns = includeMatch[1]
+      const includePattern = includeMatch[1];
+      if (!includePattern) continue;
+      const patterns = includePattern
         .split(/\s+/)
         .map((value) => normalizePath(value, dir));
 
@@ -59,7 +61,9 @@ async function parseFile(filePath: string, ctx: ParseContext): Promise<void> {
     const hostMatch = line.match(/^Host\s+(.+)$/i);
     if (!hostMatch) continue;
 
-    const patterns = hostMatch[1].split(/\s+/).filter(Boolean);
+    const hostPattern = hostMatch[1];
+    if (!hostPattern) continue;
+    const patterns = hostPattern.split(/\s+/).filter(Boolean);
     for (const alias of patterns) {
       const isWildcard = alias.includes("*") || alias.includes("?");
       ctx.hosts.push({
@@ -102,6 +106,7 @@ export async function sshEffectiveConfig(alias: string): Promise<string[]> {
 
   for (const raw of result.stdout.split(/\r?\n/)) {
     const [key, ...rest] = raw.split(" ");
+    if (!key) continue;
     if (!keys.includes(key)) continue;
     summary.push(`${key} ${rest.join(" ").trim()}`);
   }

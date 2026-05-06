@@ -19,6 +19,8 @@ describe("buildSshArgs", () => {
     expect(args).toEqual([
       "ssh",
       "-N",
+      "-o",
+      "ExitOnForwardFailure=yes",
       "-L",
       "127.0.0.1:19443:127.0.0.1:9443",
       "ssdnodes2",
@@ -41,6 +43,8 @@ describe("buildSshArgs", () => {
     expect(args).toEqual([
       "ssh",
       "-N",
+      "-o",
+      "ExitOnForwardFailure=yes",
       "-D",
       "127.0.0.1:1080",
       "-o",

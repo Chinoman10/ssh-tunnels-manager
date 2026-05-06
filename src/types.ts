@@ -53,6 +53,8 @@ export interface DockerBridgeConfig {
     networks: string[];
     containerNamePrefix: string;
     upstreamTarget?: string;
+    remoteBridgePort?: number;
+    keepFailedBridgeContainer?: boolean;
 }
 
 export interface PreflightIssue {
@@ -75,6 +77,7 @@ export interface TunnelProfile {
 }
 
 export interface CliFlags {
+    diagnose?: boolean;
     nonInteractive: boolean;
     skipPreflight: boolean;
     dryRun: boolean;
@@ -91,4 +94,6 @@ export interface CliFlags {
     dockerBridge: boolean;
     dockerNetworks: string[];
     probePermission?: ProbePermission;
+    replaceExisting?: boolean;
+    keepFailedBridgeContainer?: boolean;
 }

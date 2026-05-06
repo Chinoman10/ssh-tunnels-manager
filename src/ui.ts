@@ -125,6 +125,7 @@ export async function runTui(flags: CliFlags): Promise<void> {
     let promptRejecter: (() => void) | null = null;
     let inputMode = false;
     let isShuttingDown = false;
+    let lastStatus = "Ready.";
     let settings: { probePermission: ProbePermission } = {
         probePermission: "yes",
     };
@@ -137,6 +138,7 @@ export async function runTui(flags: CliFlags): Promise<void> {
     };
 
     const updateStatus = (text: string) => {
+        lastStatus = text;
         safeSet(status, text);
     };
 
@@ -234,12 +236,13 @@ export async function runTui(flags: CliFlags): Promise<void> {
         message: string,
         fn: (spinner: SpinnerHandle) => Promise<T>,
     ): Promise<T> => {
+        const previousStatus = lastStatus;
         const spinner = startSpinner(updateStatus, message);
         try {
             const result = await fn(spinner);
             return result;
         } finally {
-            spinner.stop();
+            spinner.stop(previousStatus);
         }
     };
 
@@ -748,16 +751,19 @@ async function runProfilesMenu(args: {
         return;
     }
 
-    await args.withSpinner(
+    const snapshot = await args.withSpinner(
         `Starting profile "${profile.name}"...`,
         async (spinner) => {
             spinner.update(
                 `Launching tunnel and Docker bridge for ${profile.name}...`,
             );
-            await args.manager.start(config);
+            return args.manager.start(config);
         },
     );
-    args.status.content = `Started profile ${profile.name}.`;
+    args.status.content =
+        snapshot.state === "failed"
+            ? `Failed profile ${profile.name}: ${snapshot.lastError ?? "see logs"}`
+            : `Started profile ${profile.name}.`;
 }
 
 // ── Create Tunnel Wizard ──
@@ -1339,5 +1345,8 @@ async function runCreateTunnelWizard(args: {
     }
 
     args.updateStatus(`Starting tunnel: ${config.name}...`);
-    await args.manager.start(config);
+    const snapshot = await args.manager.start(config);
+    if (snapshot.state === "failed") {
+        args.updateStatus(`Failed tunnel: ${snapshot.lastError ?? "see logs"}`);
+    }
 }

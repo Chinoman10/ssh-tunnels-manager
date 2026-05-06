@@ -1,5 +1,5 @@
 import path from "node:path";
-import { ProbePermission } from "./types.ts";
+import type { ProbePermission } from "./types.ts";
 import { ensureConfigDir, readJsonFile, writeJsonFile } from "./utils.ts";
 
 interface SettingsFile {

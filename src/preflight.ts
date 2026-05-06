@@ -1,6 +1,9 @@
-import { checkLocalPort } from "./ports.ts";
+import {
+    formatLocalPortOccupiedMessage,
+    inspectLocalPortOccupancy,
+} from "./ports.ts";
 import type { TunnelConfig, PreflightIssue } from "./types.ts";
-import { execCommand, sh } from "./utils.ts";
+import { execCommand } from "./utils.ts";
 
 export interface DockerStatus {
     installed: boolean;
@@ -60,15 +63,21 @@ export async function runPreflight(
         });
     }
 
-    if (config.mode === "L" && config.localPort) {
-        const localPort = await checkLocalPort(
+    if (config.mode !== "R" && config.localPort) {
+        const localPort = await inspectLocalPortOccupancy(
             config.localPort,
-            config.bindAddress,
+            config.bindAddress || "127.0.0.1",
         );
         if (!localPort.available) {
+            const occupant = localPort.occupant;
+            const bind = config.bindAddress || "127.0.0.1";
             issues.push({
                 level: "error",
-                message: `Local port ${config.bindAddress}:${config.localPort} is already in use (${localPort.error ?? "busy"}).`,
+                message: formatLocalPortOccupiedMessage(
+                    bind,
+                    config.localPort,
+                    occupant,
+                ),
             });
         }
     }
@@ -81,21 +90,6 @@ export async function runPreflight(
     }
 
     const docker = await checkDockerStatus();
-    if (config.dockerBridge?.enabled) {
-        if (!docker.installed) {
-            issues.push({
-                level: "error",
-                message:
-                    "Docker bridge was requested but Docker is not installed.",
-            });
-        } else if (!docker.accessible) {
-            issues.push({
-                level: "error",
-                message:
-                    "Docker bridge was requested but Docker daemon access is unavailable.",
-            });
-        }
-    }
 
     return { issues, docker };
 }

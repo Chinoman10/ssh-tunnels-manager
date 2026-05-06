@@ -145,7 +145,7 @@ cd ssh-tunnels-manager
 Install dependencies:
 
 ```bash
-bun install
+bun i
 ```
 
 ---
@@ -153,7 +153,7 @@ bun install
 ## Run the TUI
 
 ```bash
-bun run src/index.ts
+bun run start
 ```
 
 Or, if configured:
@@ -198,7 +198,7 @@ Common options:
 Use:
 
 ```bash
-bun run src/index.ts --help
+bun run start --help
 ```
 
 for the full option list.
@@ -262,7 +262,7 @@ Docker bridge mode is for services that are reachable from inside a Docker netwo
 Example:
 
 ```bash
-bun run src/index.ts \
+bun run start \
   --non-interactive \
   --target my-vps \
   --mode L \
@@ -429,7 +429,7 @@ bun install
 Run:
 
 ```bash
-bun run src/index.ts
+bun run start
 ```
 
 Test:

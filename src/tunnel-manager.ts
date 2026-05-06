@@ -1,9 +1,27 @@
 import { EventEmitter } from "node:events";
-import { createServer } from "node:net";
 import type { TunnelConfig } from "./types.ts";
 import {
+    formatLocalPortOccupiedMessage,
+    inspectLocalPortOccupancy,
+} from "./ports.ts";
+import {
+    checkRemoteUpstream,
+    cleanupRemoteBridge,
+    cleanupRemoteBridgeCommand,
+    collectRemoteBridgeLogs,
+    curlLocalRawUrl,
+    curlRemoteBridge,
+    detectRemoteDockerRunner,
+    inspectRemoteBridge,
+    makeBridgeContainerName,
+    normalizeDockerBridgeRuntime,
+    previewRemoteDockerCommand,
+    selectRemoteBridgePort,
+    startRemoteBridge,
+    type RemoteBridgeRuntime,
+} from "./remote-docker-bridge.ts";
+import {
     execCommand,
-    execRemoteDockerCommand,
     sh,
     type LogEntry,
 } from "./utils.ts";
@@ -24,8 +42,12 @@ export interface TunnelSessionSnapshot {
     lastError?: string;
     commandPreview: string;
     localUrl: string;
+    localUrlFriendly?: string;
+    localUrlRaw: string;
     localBind: string;
     localPort?: number;
+    localCaddyStatus?: string;
+    localCaddyMessage?: string;
 }
 
 interface TunnelSessionEvents {
@@ -41,8 +63,9 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
     private restartCount = 0;
     private state: SessionState = "starting";
     private lastError = "";
-    private dockerContainerName: string | null = null;
+    private bridgeRuntime: RemoteBridgeRuntime | null = null;
     private hintedConnectionRefused = false;
+    private rawUrlVerified = false;
     localCaddyPort = 0;
 
     constructor(config: TunnelConfig) {
@@ -55,18 +78,34 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
         const port = this.config.localPort;
         const mode = this.config.mode;
         const hostname = `${this.config.name.replace(/[^a-zA-Z0-9-]/g, "-")}.localhost`;
-        let localUrl: string;
+        const caddyPort = this.localCaddyPort;
+
         let localBind: string;
+        let localUrlRaw: string;
+        let localUrlFriendly: string | undefined;
+        let localUrl: string;
+        let localCaddyStatus: string | undefined;
+        let localCaddyMessage: string | undefined;
 
         if (mode === "D") {
             localBind = `socks5://${bind}:${port}`;
+            localUrlRaw = localBind;
             localUrl = localBind;
         } else {
             localBind = `${bind}:${port}`;
-            // Named .localhost URL — port omitted if local Caddy is on 80
-            const caddyPort = this.localCaddyPort || 8080;
-            const portSuffix = caddyPort === 80 ? "" : `:${caddyPort}`;
-            localUrl = `http://${hostname}${portSuffix}`;
+            localUrlRaw = `http://${bind}:${port}`;
+
+            if (caddyPort > 0) {
+                const portSuffix = caddyPort === 80 ? "" : `:${caddyPort}`;
+                localUrlFriendly = `http://${hostname}${portSuffix}`;
+                localUrl = localUrlFriendly;
+                localCaddyStatus = "running";
+            } else {
+                localUrl = localUrlRaw;
+                localCaddyStatus = "unavailable";
+                localCaddyMessage =
+                    "Local Caddy sidecar unavailable; friendly .localhost URL disabled.";
+            }
         }
 
         return {
@@ -78,22 +117,41 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
             lastError: this.lastError || undefined,
             commandPreview: previewCommand(this.config),
             localUrl,
+            localUrlFriendly,
+            localUrlRaw,
             localBind,
             localPort: port,
+            localCaddyStatus,
+            localCaddyMessage,
         };
     }
 
     async start(): Promise<void> {
         this.stoppedByUser = false;
+        this.rawUrlVerified = false;
         this.structured("info", `profile loaded: ${this.config.name}`);
         this.structured(
             "debug",
             `normalized config: target=${this.config.target.alias ?? this.config.target.destination}, mode=${this.config.mode}, local=${this.config.bindAddress}:${this.config.localPort}, remote=${this.config.remoteHost ?? "?"}:${this.config.remotePort ?? "?"}, dockerBridge=${this.config.dockerBridge?.enabled ? `yes (networks: ${this.config.dockerBridge.networks.join(",")}, upstream: ${this.config.dockerBridge.upstreamTarget ?? "auto"})` : "no"}`,
         );
-        if (this.config.dockerBridge?.enabled) {
-            await this.startDockerBridge();
+        try {
+            await this.preflightLocalBind();
+            if (this.config.dockerBridge?.enabled) {
+                await this.startDockerBridge();
+            }
+            await this.spawnTunnel();
+            this.rawUrlVerified = true;
+        } catch (error) {
+            this.lastError = error instanceof Error ? error.message : String(error);
+            this.structured("error", this.lastError);
+            this.state = "failed";
+            this.emit("state", this.snapshot);
+            if (this.process) {
+                this.process.kill();
+                this.process = null;
+            }
+            await this.stopDockerBridge();
         }
-        void this.spawnTunnel();
     }
 
     async stop(): Promise<void> {
@@ -107,6 +165,10 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
         }
 
         await this.stopDockerBridge();
+    }
+
+    get hasVerifiedRawUrl(): boolean {
+        return this.rawUrlVerified;
     }
 
     private structured(level: LogEntry["level"], message: string): void {
@@ -124,160 +186,119 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
         return this.config.target.alias ?? this.config.target.destination;
     }
 
-    private async startDockerBridge(): Promise<void> {
-        const bridge = this.config.dockerBridge;
-        if (!bridge?.enabled) return;
+    private async preflightLocalBind(): Promise<void> {
+        if (!this.config.localPort || this.config.mode === "R") return;
 
-        const sshDest = this.getSshDestination();
-        const name = `${bridge.containerNamePrefix}-${this.config.id}`.replace(
-            /[^a-zA-Z0-9-]/g,
-            "",
-        );
-        this.dockerContainerName = name;
-        this.structured("info", `bridge: container name ${name}`);
-
-        // Remove any existing container with the same name on the remote host
-        await execRemoteDockerCommand(sshDest, ["rm", "-f", name], 5_000);
-
-        const remotePort = this.config.remotePort ?? 9443;
-        const bridgePort = remotePort;
-        const remoteHost = this.config.remoteHost ?? "127.0.0.1";
-
-        // Determine the proxy target for Caddy:
-        // 1. Explicit upstreamTarget from config (populated by wizard from compose labels)
-        // 2. If networks are specified, derive from network name (last resort)
-        // 3. Otherwise, use the original remoteHost:remotePort
-        let proxyTarget: string;
-        let upstreamSource: string;
-
-        if (bridge.upstreamTarget) {
-            proxyTarget = bridge.upstreamTarget;
-            upstreamSource = "explicit config";
-        } else if (bridge.networks.length > 0) {
-            const firstNetwork = bridge.networks[0]!;
-            const serviceName = firstNetwork.replace(/_default$/, "");
-            proxyTarget = `${serviceName}:${remotePort}`;
-            upstreamSource = `network-derived (${firstNetwork}) [WARNING: guessing from network name]`;
-        } else {
-            proxyTarget = `${remoteHost}:${remotePort}`;
-            upstreamSource = "direct remote";
-        }
-
-        this.structured(
-            "info",
-            `bridge: upstream target ${proxyTarget} (source: ${upstreamSource})`,
-        );
-        const caddyCmd = `caddy reverse-proxy --from :80 --to ${proxyTarget}`;
-        this.structured("cmd", `bridge: ${caddyCmd}`);
-        const dockerRunArgs: string[] = [
-            "run",
-            "-d",
-            "--rm",
-            "--name",
-            name,
-            "-p",
-            `127.0.0.1:${bridgePort}:80`,
-        ];
-
-        if (bridge.networks.length > 0) {
-            dockerRunArgs.push("--network", bridge.networks[0]!);
-        }
-
-        dockerRunArgs.push("caddy:2-alpine", "sh", "-c", caddyCmd);
-
-        // ── Preflight: check upstream reachability from a temp container ──
-        this.emit(
-            "log",
-            this.config.id,
-            `Docker bridge: verifying upstream ${proxyTarget}...`,
-        );
-        const pfResult = await execRemoteDockerCommand(
-            sshDest,
-            [
-                "run",
-                "--rm",
-                "--network",
-                bridge.networks[0] ?? "host",
-                "alpine/curl:latest",
-                "curl",
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--connect-timeout",
-                "5",
-                `http://${proxyTarget}`,
-            ],
-            15_000,
-        );
-        if (pfResult.ok) {
-            this.structured(
-                "info",
-                `bridge: upstream ${proxyTarget} responded HTTP ${pfResult.stdout}`,
-            );
-        } else {
-            this.structured(
-                "warn",
-                `bridge: upstream ${proxyTarget} preflight failed: ${pfResult.stderr || pfResult.stdout || "timeout/no response"}`,
-            );
-        }
-
-        const result = await execRemoteDockerCommand(
-            sshDest,
-            dockerRunArgs,
-            12_000,
-        );
-
-        if (!result.ok) {
-            this.emit(
-                "log",
-                this.config.id,
-                `Docker bridge: remote caddy container failed to start: ${result.stderr || result.stdout}`,
-            );
+        const bind = this.config.bindAddress || "127.0.0.1";
+        const port = this.config.localPort;
+        const result = await inspectLocalPortOccupancy(port, bind);
+        if (result.available) {
+            this.structured("info", `local port preflight ok: ${bind}:${port}`);
             return;
         }
 
-        // Connect to remaining networks
-        for (const network of bridge.networks.slice(1)) {
-            const connectResult = await execRemoteDockerCommand(
-                sshDest,
-                ["network", "connect", network, name],
-                8_000,
-            );
-            if (!connectResult.ok) {
-                this.emit(
-                    "log",
-                    this.config.id,
-                    `Docker bridge: could not connect "${name}" to network "${network}": ${connectResult.stderr}`,
-                );
-            }
-        }
-
-        // Reroute the tunnel to go through Caddy on the remote host
-        this.config.remoteHost = "127.0.0.1";
-        this.config.remotePort = bridgePort;
-
-        this.structured(
-            "info",
-            `bridge: caddy container started (${upstreamSource})`,
-        );
-        this.emit(
-            "log",
-            this.config.id,
-            `Docker bridge: caddy sidecar "${name}" started on ${sshDest}${result.usedSudo ? " [sudo]" : ""} (${upstreamSource}).`,
+        const occupant = result.occupant;
+        throw new Error(
+            `FIRST_BROKEN_HOP=local-port-occupied ${formatLocalPortOccupiedMessage(bind, port, occupant)}`,
         );
     }
 
-    private async stopDockerBridge(): Promise<void> {
-        if (!this.dockerContainerName) return;
-        const sshDest = this.getSshDestination();
-        await execRemoteDockerCommand(
-            sshDest,
-            ["rm", "-f", this.dockerContainerName],
-            5_000,
+    private async startDockerBridge(): Promise<void> {
+        const normalized = normalizeDockerBridgeRuntime(this.config);
+        this.structured(
+            "info",
+            `bridge: upstream target ${normalized.upstreamTarget} on network ${normalized.network}`,
         );
-        this.dockerContainerName = null;
+
+        const docker = await detectRemoteDockerRunner(normalized.sshTarget);
+        if (!docker.ok) {
+            throw new Error(
+                "FIRST_BROKEN_HOP=remote-docker-unavailable Remote Docker is required for this profile's Docker bridge, but the SSH user cannot run docker directly or via passwordless sudo.",
+            );
+        }
+        this.structured("info", `bridge: selected remote Docker prefix ${docker.runner.label}`);
+
+        const upstream = await checkRemoteUpstream(normalized, docker.runner);
+        if (!upstream.ok) {
+            throw new Error(
+                `FIRST_BROKEN_HOP=remote-upstream-unreachable Remote upstream check failed (exit ${upstream.code}): ${upstream.stderr || upstream.stdout || "no output"}`,
+            );
+        }
+        this.structured("info", "bridge: remote upstream check ok");
+
+        const selectedPort = await selectRemoteBridgePort(normalized.sshTarget);
+        if (!selectedPort.ok || !selectedPort.port) {
+            throw new Error(
+                `FIRST_BROKEN_HOP=remote-bridge-port-unavailable No free remote loopback bridge port was found in 41000-41999 (${selectedPort.stderr || selectedPort.stdout || "no output"}).`,
+            );
+        }
+
+        const runtime: RemoteBridgeRuntime = {
+            ...normalized,
+            remoteDocker: docker.runner,
+            remoteBridgePort: selectedPort.port,
+            bridgeContainerName: makeBridgeContainerName(normalized.profileSlug),
+        };
+        this.bridgeRuntime = runtime;
+        this.structured(
+            "info",
+            `bridge: selected remoteBridgePort ${runtime.remoteBridgePort}`,
+        );
+        this.structured(
+            "info",
+            `bridge: container name ${runtime.bridgeContainerName}`,
+        );
+        this.structured(
+            "cmd",
+            `bridge: ${previewRemoteDockerCommand(runtime.sshTarget, runtime.remoteDocker, [
+                "run",
+                "-d",
+                "--name",
+                runtime.bridgeContainerName,
+                "-p",
+                `127.0.0.1:${runtime.remoteBridgePort}:80`,
+                "--network",
+                runtime.network,
+                "caddy:2-alpine",
+                "caddy",
+                "reverse-proxy",
+                "--from",
+                ":80",
+                "--to",
+                runtime.upstreamTarget,
+            ])}`,
+        );
+
+        const started = await startRemoteBridge(runtime, { removeOnExit: false });
+        if (!started.ok) {
+            throw new Error(
+                `FIRST_BROKEN_HOP=remote-bridge-start-failed Remote Caddy bridge failed to start (exit ${started.code}): ${started.stderr || started.stdout || "no output"}. Cleanup: ${cleanupRemoteBridgeCommand(runtime)}`,
+            );
+        }
+
+        const status = await inspectRemoteBridge(runtime);
+        this.structured(
+            status.ok && status.stdout ? "info" : "warn",
+            `bridge: container status ${status.stdout || status.stderr || "not found"}`,
+        );
+
+        const bridgeCurl = await curlRemoteBridge(runtime);
+        if (!bridgeCurl.ok) {
+            const collected = await collectRemoteBridgeLogs(runtime);
+            throw new Error(
+                `FIRST_BROKEN_HOP=remote-bridge-port-unreachable Remote bridge curl failed (exit ${bridgeCurl.code}): ${bridgeCurl.stderr || bridgeCurl.stdout || "no output"}. Logs: ${collected.logs.stdout || collected.logs.stderr || "none"}. Inspect: ${collected.inspect.stdout.slice(0, 600) || collected.inspect.stderr || "none"}`,
+            );
+        }
+
+        this.config.remoteHost = "127.0.0.1";
+        this.config.remotePort = runtime.remoteBridgePort;
+        this.structured("info", "bridge: remote loopback bridge verified");
+    }
+
+    private async stopDockerBridge(): Promise<void> {
+        if (!this.bridgeRuntime) return;
+        await cleanupRemoteBridge(this.bridgeRuntime);
+        this.bridgeRuntime = null;
     }
 
     private async spawnTunnel(): Promise<void> {
@@ -295,10 +316,71 @@ class TunnelSession extends EventEmitter<TunnelSessionEvents> {
         this.emit("state", this.snapshot);
 
         const id = this.config.id;
-        void this.readStream(this.process.stdout, id);
-        void this.readStream(this.process.stderr, id);
+        if (this.process.stdout instanceof ReadableStream) {
+            void this.readStream(this.process.stdout, id);
+        }
+        if (this.process.stderr instanceof ReadableStream) {
+            void this.readStream(this.process.stderr, id);
+        }
 
-        const code = await this.process.exited;
+        let exitedCode: number | null = null;
+        const exited = this.process.exited.then((code) => {
+            exitedCode = code;
+            return code;
+        });
+
+        const bind = this.config.bindAddress || "127.0.0.1";
+        const port =
+            this.config.mode === "D"
+                ? (this.config.dynamicPort ?? this.config.localPort)
+                : this.config.localPort;
+
+        for (let attempt = 0; attempt < 25; attempt += 1) {
+            if (exitedCode !== null) {
+                throw new Error(
+                    `FIRST_BROKEN_HOP=ssh-bind-failed ssh exited early with code ${exitedCode}`,
+                );
+            }
+            if (port && !(await inspectLocalPortOccupancy(port, bind)).available) {
+                break;
+            }
+            await Bun.sleep(200);
+        }
+
+        if (exitedCode !== null) {
+            throw new Error(
+                `FIRST_BROKEN_HOP=ssh-bind-failed ssh exited early with code ${exitedCode}`,
+            );
+        }
+
+        const requiresRawHttpVerification =
+            this.config.mode !== "D" && this.config.dockerBridge?.enabled;
+        if (requiresRawHttpVerification && port) {
+            const raw = await curlLocalRawUrl(bind, port);
+            if (!raw.ok) {
+                if (this.bridgeRuntime) {
+                    const remoteCurl = await curlRemoteBridge(this.bridgeRuntime);
+                    const collected = await collectRemoteBridgeLogs(
+                        this.bridgeRuntime,
+                    );
+                    throw new Error(
+                        `FIRST_BROKEN_HOP=local-raw-url-failed Local raw URL ${raw.url} failed (exit ${raw.code}): ${raw.stderr || raw.stdout || "no output"}. Remote bridge curl: ${remoteCurl.ok ? "ok" : remoteCurl.stderr || remoteCurl.stdout || "failed"}. Bridge logs: ${collected.logs.stdout || collected.logs.stderr || "none"}`,
+                    );
+                }
+                throw new Error(
+                    `FIRST_BROKEN_HOP=local-raw-url-failed Local raw URL ${raw.url} failed (exit ${raw.code}): ${raw.stderr || raw.stdout || "no output"}`,
+                );
+            }
+            this.structured("info", `local raw URL verified: ${raw.url}`);
+        } else if (port) {
+            this.structured("info", `local listener verified: ${bind}:${port}`);
+        }
+
+        void this.monitorProcess(exited, id);
+    }
+
+    private async monitorProcess(exited: Promise<number>, id: string): Promise<void> {
+        const code = await exited;
         this.process = null;
 
         if (this.stoppedByUser) {
@@ -371,9 +453,7 @@ export class TunnelManager extends EventEmitter<TunnelSessionEvents> {
     private sessions = new Map<string, TunnelSession>();
     private logs = new Map<string, string[]>();
     private structuredLogs = new Map<string, LogEntry[]>();
-    private localCaddy: Bun.Subprocess | null = null;
-    private localCaddyPort = 8080;
-    private localCaddyConfigPath = "";
+    private localCaddy = new LocalCaddyManager(this);
 
     async start(config: TunnelConfig): Promise<TunnelSessionSnapshot> {
         const session = new TunnelSession(config);
@@ -398,8 +478,10 @@ export class TunnelManager extends EventEmitter<TunnelSessionEvents> {
 
         await session.start();
 
-        // Start/update local Caddy for named .localhost routing
-        await this.ensureLocalCaddy();
+        // Local friendly URLs are optional; do not start them until raw URL works.
+        if (session.hasVerifiedRawUrl) {
+            await this.localCaddy.ensureRunning();
+        }
 
         return session.snapshot;
     }
@@ -409,18 +491,23 @@ export class TunnelManager extends EventEmitter<TunnelSessionEvents> {
         if (!session) return;
         await session.stop();
         this.sessions.delete(id);
-        await this.ensureLocalCaddy();
+        await this.localCaddy.ensureRunning();
     }
 
     async stopAll(): Promise<void> {
         for (const id of this.sessions.keys()) {
             await this.stop(id);
         }
-        await this.stopLocalCaddy();
+        await this.localCaddy.stop();
     }
 
     list(): TunnelSessionSnapshot[] {
         return [...this.sessions.values()].map((s) => s.snapshot);
+    }
+
+    /** Exposes raw session for LocalCaddyManager port update */
+    getSessionById(id: string): TunnelSession | undefined {
+        return this.sessions.get(id);
     }
 
     getLogs(id: string): string[] {
@@ -431,100 +518,144 @@ export class TunnelManager extends EventEmitter<TunnelSessionEvents> {
         return this.structuredLogs.get(id) ?? [];
     }
 
-    // ── Local Caddy for named .localhost domains ──
+    getLocalCaddyPort(): number {
+        return this.localCaddy.selectedPort;
+    }
+}
 
-    private static readonly CADDY_PORT_CANDIDATES = [
-        80, 8080, 8081, 8888, 9080,
-    ];
+// ── Local Caddy Manager (Docker-based, ephemeral) ──
 
-    private async findLocalCaddyPort(): Promise<{
-        port: number;
-        reason?: string;
-    }> {
-        // Try each candidate in order
-        for (const port of TunnelManager.CADDY_PORT_CANDIDATES) {
-            const available = await new Promise<boolean>((resolve) => {
-                const server = createServer();
-                server.once("error", (err: NodeJS.ErrnoException) => {
-                    server.close();
-                    if (err.code === "EACCES" || err.code === "EPERM") {
-                        // Permission denied on port 80 — don't try further low ports
-                        if (port === 80) {
-                            this.emit(
-                                "log",
-                                "manager",
-                                "Local Caddy: port 80 requires elevated permissions. Falling back.",
-                            );
-                        }
-                        resolve(false);
-                    } else {
-                        resolve(false); // EADDRINUSE or other
-                    }
-                });
-                server.once("listening", () => {
-                    server.close();
-                    resolve(true);
-                });
-                server.listen(port, "127.0.0.1");
-            });
+class LocalCaddyManager {
+    private static readonly CONTAINER_NAME = "stm-local-caddy";
+    private static readonly PORT_CANDIDATES = [80, 8080, 8081, 8888, 9080];
+    private static readonly DYNAMIC_START = 10080;
+    private static readonly DYNAMIC_END = 10180;
 
-            if (available) {
-                return { port };
-            }
-        }
+    selectedPort = 0;
+    private configPath = "";
+    private lastError = "";
+    private upstreamUrl = "";
+    private usedHostNetwork = false;
 
-        // Dynamic scan upward from 10080
-        for (let port = 10080; port <= 10180; port++) {
-            const available = await new Promise<boolean>((resolve) => {
-                const server = createServer();
-                server.once("error", () => {
-                    server.close();
-                    resolve(false);
-                });
-                server.once("listening", () => {
-                    server.close();
-                    resolve(true);
-                });
-                server.listen(port, "127.0.0.1");
-            });
-            if (available) {
-                return { port, reason: "fallback dynamic" };
-            }
-        }
+    constructor(private manager: TunnelManager) {}
 
-        return { port: 8080, reason: "all ports busy, defaulting to 8080" };
+    private log(msg: string): void {
+        this.manager.emit("log", "manager", `Local Caddy: ${msg}`);
     }
 
-    private async ensureLocalCaddy(): Promise<void> {
-        const sessions = this.list();
+    async ensureRunning(): Promise<void> {
+        const sessions = this.manager
+            .list()
+            .filter((s) => s.state !== "stopped" && s.state !== "failed");
+
         if (sessions.length === 0) {
-            await this.stopLocalCaddy();
+            await this.stop();
             return;
         }
 
-        // Only find port if we don't already have a working Caddy
-        if (!this.localCaddy) {
-            const { port, reason } = await this.findLocalCaddyPort();
-            this.localCaddyPort = port;
-            if (reason) {
-                this.emit("log", "manager", `Local Caddy: ${reason}`);
-            }
-        }
+        const first = sessions.find((s) => s.localPort);
+        if (!first?.localPort) return;
+        this.upstreamUrl = `http://host.docker.internal:${first.localPort}`;
 
-        // Build Caddyfile with bind 127.0.0.1 and hostname:port site addresses
+        try {
+            const dockerOk = await this.checkDocker();
+            if (!dockerOk) {
+                this.disable("Docker unavailable");
+                return;
+            }
+
+            if (this.selectedPort === 0) {
+                this.selectedPort = await this.probePort();
+                if (this.selectedPort === 0) {
+                    this.disable("No host port available");
+                    return;
+                }
+            }
+
+            // Try bridge mode first
+            const bridgeOk = await this.tryStartContainer(false, sessions);
+            if (bridgeOk) {
+                this.usedHostNetwork = false;
+                this.updateSessionPorts();
+                return;
+            }
+
+            // Fallback: host networking
+            this.log("Bridge mode failed; trying host networking...");
+            await execCommand(
+                ["docker", "rm", "-f", LocalCaddyManager.CONTAINER_NAME],
+                3_000,
+            );
+            const hostOk = await this.tryStartContainer(true, sessions);
+            if (hostOk) {
+                this.usedHostNetwork = true;
+                this.updateSessionPorts();
+                return;
+            }
+
+            // Both failed
+            await execCommand(
+                ["docker", "rm", "-f", LocalCaddyManager.CONTAINER_NAME],
+                3_000,
+            );
+            this.disable(
+                this.lastError ||
+                    "Local Caddy could not reach the local SSH listener.",
+            );
+        } catch (err) {
+            this.disable(err instanceof Error ? err.message : String(err));
+            await execCommand(
+                ["docker", "rm", "-f", LocalCaddyManager.CONTAINER_NAME],
+                3_000,
+            );
+        }
+    }
+
+    private disable(reason: string): void {
+        this.log(reason);
+        this.lastError = reason;
+        this.selectedPort = 0;
+        this.updateSessionPorts();
+    }
+
+    async stop(): Promise<void> {
+        try {
+            await execCommand(
+                ["docker", "rm", "-f", LocalCaddyManager.CONTAINER_NAME],
+                5_000,
+            );
+        } catch {
+            /* ignore */
+        }
+        this.selectedPort = 0;
+        this.lastError = "";
+        this.upstreamUrl = "";
+        this.usedHostNetwork = false;
+        this.updateSessionPorts();
+        await this.cleanupConfig();
+    }
+
+    private async checkDocker(): Promise<boolean> {
+        return (await execCommand(["docker", "info", "--format", "ok"], 3_000))
+            .ok;
+    }
+
+    private async tryStartContainer(
+        hostNetwork: boolean,
+        sessions: TunnelSessionSnapshot[],
+    ): Promise<boolean> {
         const siteBlocks = sessions
             .filter((s) => s.localPort)
             .map((s) => {
                 const hostname = `${s.name.replace(/[^a-zA-Z0-9-]/g, "-")}.localhost`;
-                const portSuffix =
-                    this.localCaddyPort === 80 ? "" : `:${this.localCaddyPort}`;
-                return `http://${hostname}${portSuffix} {
-    bind 127.0.0.1
-    reverse_proxy 127.0.0.1:${s.localPort}
+                const upstream = hostNetwork
+                    ? `127.0.0.1:${s.localPort}`
+                    : `host.docker.internal:${s.localPort}`;
+                return `http://${hostname} {
+    bind 0.0.0.0
+    reverse_proxy ${upstream}
 }`;
             });
-
-        if (siteBlocks.length === 0) return;
 
         const caddyfile = `{
     admin off
@@ -534,69 +665,201 @@ export class TunnelManager extends EventEmitter<TunnelSessionEvents> {
 ${siteBlocks.join("\n\n")}
 `;
 
-        // Write Caddyfile
         const tmpDir = Bun.env.TMPDIR || Bun.env.TMP || "/tmp";
-        const configName = `stm-local-caddy-${Date.now()}.Caddyfile`;
-        this.localCaddyConfigPath = `${tmpDir}/${configName}`;
-        await Bun.write(this.localCaddyConfigPath, caddyfile);
+        this.configPath = `${tmpDir}/stm-local-caddy-${Date.now()}.Caddyfile`;
+        await Bun.write(this.configPath, caddyfile);
 
-        // Stop existing local Caddy
-        if (this.localCaddy) {
-            this.localCaddy.kill();
-            this.localCaddy = null;
+        await execCommand(
+            ["docker", "rm", "-f", LocalCaddyManager.CONTAINER_NAME],
+            5_000,
+        );
+
+        const dockerArgs: string[] = [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            LocalCaddyManager.CONTAINER_NAME,
+        ];
+
+        if (hostNetwork) {
+            dockerArgs.push("--network", "host");
+        } else {
+            dockerArgs.push(
+                "-p",
+                `127.0.0.1:${this.selectedPort}:80`,
+                "--add-host",
+                "host.docker.internal:host-gateway",
+            );
         }
 
-        // Start local Caddy
-        this.localCaddy = Bun.spawn(
+        dockerArgs.push(
+            "-v",
+            `${this.configPath}:/etc/caddy/Caddyfile:ro`,
+            "caddy:2-alpine",
+            "caddy",
+            "run",
+            "--config",
+            "/etc/caddy/Caddyfile",
+            "--adapter",
+            "caddyfile",
+        );
+
+        const result = await execCommand(dockerArgs, 15_000);
+        if (!result.ok) {
+            this.lastError = `Container start failed: ${result.stderr.slice(0, 200)}`;
+            this.log(this.lastError);
+            return false;
+        }
+
+        await Bun.sleep(800);
+
+        // Readiness: can Caddy reach upstream from inside?
+        const upstream = hostNetwork
+            ? `127.0.0.1:${sessions.find((s) => s.localPort)?.localPort ?? 9000}`
+            : `host.docker.internal:${sessions.find((s) => s.localPort)?.localPort ?? 9000}`;
+
+        const execResult = await execCommand(
             [
-                "caddy",
-                "run",
-                "--config",
-                this.localCaddyConfigPath,
-                "--adapter",
-                "caddyfile",
+                "docker",
+                "exec",
+                LocalCaddyManager.CONTAINER_NAME,
+                "wget",
+                "-q",
+                "-S",
+                "-O",
+                "-",
+                "--timeout=4",
+                `http://${upstream}/`,
             ],
-            { stdout: "pipe", stderr: "pipe" },
+            8_000,
         );
 
-        // Update session URLs with the actual port
-        for (const id of this.sessions.keys()) {
-            const session = this.sessions.get(id);
-            if (session) {
-                session.localCaddyPort = this.localCaddyPort;
-            }
+        if (!execResult.ok) {
+            this.lastError = `Caddy cannot reach upstream ${upstream}: ${execResult.stderr.slice(0, 150)}`;
+            this.log(this.lastError);
+            return false;
         }
 
-        this.emit(
-            "log",
-            "manager",
-            `Local Caddy listening on 127.0.0.1:${this.localCaddyPort} with ${siteBlocks.length} route(s).`,
+        // Readiness: can host reach Caddy?
+        const hostCheck = await sh(
+            `curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 http://127.0.0.1:${this.selectedPort}/`,
         );
+        if (!["200", "404", "502"].includes(hostCheck.stdout)) {
+            this.lastError = `Host cannot reach Caddy on 127.0.0.1:${this.selectedPort} (HTTP ${hostCheck.stdout || hostCheck.exitCode})`;
+            this.log(this.lastError);
+            return false;
+        }
+
+        if (hostCheck.stdout === "502") {
+            this.lastError = `Caddy returns 502 — upstream ${upstream} unreachable from container.`;
+            this.log(this.lastError);
+            return false;
+        }
+
+        this.log(
+            `Ready on 127.0.0.1:${this.selectedPort} (${hostNetwork ? "host" : "bridge"} mode, ${siteBlocks.length} route(s)).`,
+        );
+        return true;
     }
 
-    private async stopLocalCaddy(): Promise<void> {
-        if (this.localCaddy) {
-            this.localCaddy.kill();
-            this.localCaddy = null;
+    private async probePort(): Promise<number> {
+        const candidates = [
+            ...LocalCaddyManager.PORT_CANDIDATES,
+            ...Array.from(
+                {
+                    length:
+                        LocalCaddyManager.DYNAMIC_END -
+                        LocalCaddyManager.DYNAMIC_START +
+                        1,
+                },
+                (_, i) => LocalCaddyManager.DYNAMIC_START + i,
+            ),
+        ];
+
+        for (const port of candidates) {
+            const probeName = `stm-local-caddy-port-probe-${port}`;
+            await execCommand(["docker", "rm", "-f", probeName], 2_000);
+
+            const result = await execCommand(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    probeName,
+                    "-p",
+                    `127.0.0.1:${port}:80`,
+                    "caddy:2-alpine",
+                    "caddy",
+                    "respond",
+                    "--listen",
+                    ":80",
+                    "--body",
+                    "ok",
+                ],
+                15_000,
+            );
+
+            if (result.ok) {
+                await Bun.sleep(400);
+                const curl = await sh(
+                    `curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 http://127.0.0.1:${port}/`,
+                );
+                await execCommand(["docker", "rm", "-f", probeName], 3_000);
+                if (curl.stdout === "200") {
+                    this.log(`Selected port ${port}.`);
+                    return port;
+                }
+                continue;
+            }
+
+            const stderr = result.stderr.toLowerCase();
+            if (
+                stderr.includes("port is already allocated") ||
+                stderr.includes("bind: address already in use")
+            )
+                continue;
+            if (
+                (stderr.includes("permission denied") ||
+                    stderr.includes("eacces")) &&
+                port === 80
+            ) {
+                this.log(
+                    "Port 80 requires elevated permissions. Falling back.",
+                );
+                continue;
+            }
         }
-        if (this.localCaddyConfigPath) {
+        return 0;
+    }
+
+    private updateSessionPorts(): void {
+        for (const snapshot of this.manager.list()) {
+            const session = this.manager.getSessionById(snapshot.id);
+            if (session) {
+                session.localCaddyPort = this.selectedPort;
+            }
+        }
+    }
+
+    private async cleanupConfig(): Promise<void> {
+        if (this.configPath) {
             try {
-                await Bun.file(this.localCaddyConfigPath).delete();
+                await Bun.file(this.configPath).delete();
             } catch {
                 // ignore
             }
-            this.localCaddyConfigPath = "";
+            this.configPath = "";
         }
-    }
-
-    getLocalCaddyPort(): number {
-        return this.localCaddyPort;
     }
 }
 
 export function buildSshArgs(config: TunnelConfig): string[] {
     const destination = config.target.alias ?? config.target.destination;
-    const args: string[] = ["ssh", "-N"];
+    const args: string[] = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes"];
 
     if (config.mode === "L") {
         const bind = `${config.bindAddress}:${config.localPort}`;

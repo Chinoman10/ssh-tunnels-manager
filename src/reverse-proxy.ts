@@ -1,4 +1,4 @@
-import { ReverseProxyDetection, TunnelTarget } from "./types.ts";
+import type { ReverseProxyDetection, TunnelTarget } from "./types.ts";
 import { execCommand } from "./utils.ts";
 
 function parseDomains(raw: string): string[] {

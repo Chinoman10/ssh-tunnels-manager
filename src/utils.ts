@@ -37,9 +37,13 @@ export async function execCommand(
         proc.kill();
     }, timeoutMs);
 
+    const stdoutStream =
+        proc.stdout instanceof ReadableStream ? proc.stdout : undefined;
+    const stderrStream =
+        proc.stderr instanceof ReadableStream ? proc.stderr : undefined;
     const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
+        stdoutStream ? new Response(stdoutStream).text() : "",
+        stderrStream ? new Response(stderrStream).text() : "",
     ]);
     const code = await proc.exited;
     clearTimeout(timeout);
@@ -153,6 +157,11 @@ export function buildSshDockerCommand(
     target: string,
     dockerArgs: string[],
 ): string[] {
+    const quote = (value: string) =>
+        /^[a-zA-Z0-9_./:=@%+-]+$/.test(value)
+            ? value
+            : `'${value.replaceAll("'", "'\\''")}'`;
+    const remoteCommand = ["docker", ...dockerArgs].map(quote).join(" ");
     return [
         "ssh",
         "-o",
@@ -160,8 +169,7 @@ export function buildSshDockerCommand(
         "-o",
         "ConnectTimeout=8",
         target,
-        "docker",
-        ...dockerArgs,
+        remoteCommand,
     ];
 }
 
@@ -225,9 +233,13 @@ export async function execRemoteDockerCommand(
                 "-o",
                 "ConnectTimeout=8",
                 target,
-                "sudo",
-                "docker",
-                ...dockerArgs,
+                ["sudo", "-n", "docker", ...dockerArgs]
+                    .map((value) =>
+                        /^[a-zA-Z0-9_./:=@%+-]+$/.test(value)
+                            ? value
+                            : `'${value.replaceAll("'", "'\\''")}'`,
+                    )
+                    .join(" "),
             ],
             timeoutMs,
         );
