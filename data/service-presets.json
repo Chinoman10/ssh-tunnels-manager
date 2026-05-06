@@ -1,0 +1,154 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2026-05-04",
+  "entries": [
+    {
+      "id": "web-http",
+      "name": "Web HTTP",
+      "category": "web",
+      "ports": [
+        { "port": 80, "protocol": "tcp", "note": "Standard HTTP" }
+      ]
+    },
+    {
+      "id": "web-https",
+      "name": "Web HTTPS",
+      "category": "web",
+      "ports": [
+        { "port": 443, "protocol": "tcp", "note": "Standard HTTPS" }
+      ]
+    },
+    {
+      "id": "coolify",
+      "name": "Coolify",
+      "category": "self-hosted",
+      "ports": [
+        { "port": 8000, "protocol": "tcp", "note": "Typical Coolify app/admin port" }
+      ]
+    },
+    {
+      "id": "portainer",
+      "name": "Portainer",
+      "category": "self-hosted",
+      "ports": [
+        { "port": 9443, "protocol": "tcp", "note": "Default HTTPS UI" },
+        { "port": 9000, "protocol": "tcp", "note": "Legacy HTTP UI" }
+      ]
+    },
+    {
+      "id": "dockge",
+      "name": "Dockge",
+      "category": "self-hosted",
+      "ports": [
+        { "port": 5001, "protocol": "tcp", "note": "Common Dockge web UI" }
+      ]
+    },
+    {
+      "id": "grafana",
+      "name": "Grafana",
+      "category": "monitoring",
+      "ports": [
+        { "port": 3000, "protocol": "tcp", "note": "Default web UI" }
+      ]
+    },
+    {
+      "id": "prometheus",
+      "name": "Prometheus",
+      "category": "monitoring",
+      "ports": [
+        { "port": 9090, "protocol": "tcp", "note": "Default web UI" }
+      ]
+    },
+    {
+      "id": "beszel",
+      "name": "Beszel",
+      "category": "monitoring",
+      "ports": [
+        { "port": 8090, "protocol": "tcp", "note": "Common UI port" }
+      ]
+    },
+    {
+      "id": "uptime-kuma",
+      "name": "Uptime Kuma",
+      "category": "monitoring",
+      "ports": [
+        { "port": 3001, "protocol": "tcp", "note": "Default web UI" }
+      ]
+    },
+    {
+      "id": "jellyfin",
+      "name": "Jellyfin",
+      "category": "media",
+      "ports": [
+        { "port": 8096, "protocol": "tcp", "note": "Default HTTP" },
+        { "port": 8920, "protocol": "tcp", "note": "Default HTTPS" }
+      ]
+    },
+    {
+      "id": "immich",
+      "name": "Immich",
+      "category": "media",
+      "ports": [
+        { "port": 2283, "protocol": "tcp", "note": "Default web UI" }
+      ]
+    },
+    {
+      "id": "n8n",
+      "name": "n8n",
+      "category": "automation",
+      "ports": [
+        { "port": 5678, "protocol": "tcp", "note": "Default web UI" }
+      ]
+    },
+    {
+      "id": "minecraft-java",
+      "name": "Minecraft (Java)",
+      "category": "games",
+      "ports": [
+        { "port": 25565, "protocol": "tcp", "note": "Default game port" }
+      ]
+    },
+    {
+      "id": "minecraft-bedrock",
+      "name": "Minecraft (Bedrock)",
+      "category": "games",
+      "ports": [
+        { "port": 19132, "protocol": "udp", "note": "Default Bedrock port (SSH tunneling does not support UDP)" }
+      ]
+    },
+    {
+      "id": "source-engine",
+      "name": "Source Engine (CS:S, GMod)",
+      "category": "games",
+      "ports": [
+        { "port": 27015, "protocol": "udp", "note": "Typical server port (SSH tunneling does not support UDP)" },
+        { "port": 27015, "protocol": "tcp", "note": "Some tooling/query workflows" }
+      ]
+    },
+    {
+      "id": "valheim",
+      "name": "Valheim",
+      "category": "games",
+      "ports": [
+        { "port": 2456, "protocol": "udp", "note": "Part of default 2456-2458 range (SSH tunneling does not support UDP)" }
+      ]
+    },
+    {
+      "id": "terraria",
+      "name": "Terraria",
+      "category": "games",
+      "ports": [
+        { "port": 7777, "protocol": "tcp", "note": "Default game port" }
+      ]
+    },
+    {
+      "id": "rust",
+      "name": "Rust",
+      "category": "games",
+      "ports": [
+        { "port": 28015, "protocol": "udp", "note": "Default game port (SSH tunneling does not support UDP)" },
+        { "port": 28016, "protocol": "tcp", "note": "Typical RCON port" }
+      ]
+    }
+  ]
+}

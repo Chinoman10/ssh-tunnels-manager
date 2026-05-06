@@ -1,0 +1,25 @@
+{
+  "name": "ssh-tunnels-manager",
+  "module": "src/index.tsx",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "build": "bun build src/index.ts --compile --outfile dist/ssh-tunnels-manager"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.2.1"
+  },
+  "optionalDependencies": {
+    "@opentui/core-linux-x64": "^0.2.1",
+    "@opentui/core-win32-x64": "^0.2.1"
+  }
+}
